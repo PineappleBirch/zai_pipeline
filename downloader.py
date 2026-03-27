@@ -19,7 +19,11 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://obcan.justice.sk/pilot/api/ress-isu-service"
 GCS_BUCKET = os.environ["GCS_BUCKET"]           # e.g. zakonai-legal-archive
 GCS_PREFIX = os.environ.get("GCS_PREFIX", "sk/case-law")
-DB_DSN = os.environ["DB_DSN"]                   # postgres://user:pass@host:5432/dbname
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ["DB_NAME"]
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASSWORD = os.environ["DB_PASSWORD"]
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "10"))
 DELAY = float(os.environ.get("DELAY", "0.3"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
@@ -317,7 +321,10 @@ async def main():
     gcs_client = storage.Client()
     gcs_bucket = gcs_client.bucket(GCS_BUCKET)
 
-    conn = await asyncpg.connect(DB_DSN)
+    conn = await asyncpg.connect(
+        host=DB_HOST, port=DB_PORT, database=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD
+    )
     try:
         await init_db(conn)
 

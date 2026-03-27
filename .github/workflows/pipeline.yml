@@ -33,7 +33,10 @@ jobs:
       - name: Run pipeline
         env:
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-          DB_DSN: ${{ secrets.DB_DSN }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           MAX_WORKERS: "8"
           DELAY: "0.3"
         run: python downloader.py
