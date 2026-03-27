@@ -36,4 +36,4 @@ jobs:
           DB_DSN: ${{ secrets.DB_DSN }}
           MAX_WORKERS: "8"
           DELAY: "0.3"
-        run: python downloader_gcp.py
+        run: python downloader.py
