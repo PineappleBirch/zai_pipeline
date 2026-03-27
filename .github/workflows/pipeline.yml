@@ -3,6 +3,10 @@ name: Download Pipeline
 on:
   workflow_dispatch:        # Manual trigger only
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
