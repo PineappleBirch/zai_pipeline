@@ -90,12 +90,14 @@ async def init_db(conn):
 
 
 # --- Step 1: Collect GUIDs ---
-async def collect_guids(session, conn):
-    state = await conn.fetchrow("SELECT last_page, num_found, completed FROM collection_state WHERE id=1")
+async def collect_guids(session, pool):
+    async with pool.acquire() as conn:
+        state = await conn.fetchrow("SELECT last_page, num_found, completed FROM collection_state WHERE id=1")
     last_page, num_found, completed = state["last_page"], state["num_found"], state["completed"]
 
     if completed:
-        total = await conn.fetchval("SELECT COUNT(*) FROM decisions")
+        async with pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM decisions")
         log.info(f"GUID collection already complete — {total} GUIDs in DB")
         return total
 
@@ -112,7 +114,6 @@ async def collect_guids(session, conn):
         if not decisions:
             break
 
-        # Batch insert
         rows = []
         for d in decisions:
             guid = d.get("guid")
@@ -128,20 +129,20 @@ async def collect_guids(session, conn):
                 d.get("ecli"),
             ))
 
-        await conn.executemany("""
-            INSERT INTO decisions (guid, forma, sud, sudca, spisova_znacka, datum_vydania, ecli)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (guid) DO NOTHING
-        """, rows)
+        async with pool.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO decisions (guid, forma, sud, sudca, spisova_znacka, datum_vydania, ecli)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (guid) DO NOTHING
+            """, rows)
+            await conn.execute(
+                "UPDATE collection_state SET last_page=$1, num_found=$2 WHERE id=1",
+                page + 1, num_found
+            )
 
         total_collected += len(decisions)
         num_found = data.get("numFound", 0)
         log.info(f"Page {page} | collected {total_collected}/{num_found}")
-
-        await conn.execute(
-            "UPDATE collection_state SET last_page=$1, num_found=$2 WHERE id=1",
-            page + 1, num_found
-        )
 
         if len(decisions) < PAGE_SIZE:
             break
@@ -149,7 +150,8 @@ async def collect_guids(session, conn):
         page += 1
         await asyncio.sleep(DELAY)
 
-    await conn.execute("UPDATE collection_state SET completed=TRUE WHERE id=1")
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE collection_state SET completed=TRUE WHERE id=1")
     log.info(f"GUID collection done. Total: {total_collected}")
     return total_collected
 
@@ -187,7 +189,7 @@ rate_tracker = RateLimitTracker()
 
 
 # --- Step 2: Download PDFs ---
-async def fetch_and_download(session, semaphore, conn, gcs_bucket, guid):
+async def fetch_and_download(session, semaphore, pool, gcs_bucket, guid):
     async with semaphore:
         await rate_tracker.wait_if_paused()
 
@@ -196,28 +198,31 @@ async def fetch_and_download(session, semaphore, conn, gcs_bucket, guid):
             async with session.get(f"{BASE_URL}/v1/rozhodnutie/{guid}", timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status in (429, 503):
                     await rate_tracker.record_429()
-                    await conn.execute(
-                        "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
-                        guid
-                    )
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
+                            guid
+                        )
                     return False
                 detail = await r.json()
                 await rate_tracker.record_success()
         except Exception as e:
             log.error(f"Failed to fetch detail for {guid}: {e}")
-            await conn.execute(
-                "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
-                guid
-            )
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
+                    guid
+                )
             return False
 
         dokument = detail.get("dokument")
         if not dokument or not dokument.get("url"):
             log.warning(f"No document URL for {guid}")
-            await conn.execute(
-                "UPDATE decisions SET status='dead', updated_at=NOW() WHERE guid=$1",
-                guid
-            )
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE decisions SET status='dead', updated_at=NOW() WHERE guid=$1",
+                    guid
+                )
             return False
 
         oblast = ", ".join(detail.get("oblast", []))
@@ -235,10 +240,11 @@ async def fetch_and_download(session, semaphore, conn, gcs_bucket, guid):
             async with session.get(doc_url, timeout=aiohttp.ClientTimeout(total=60)) as r:
                 if r.status in (429, 503):
                     await rate_tracker.record_429()
-                    await conn.execute(
-                        "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
-                        guid
-                    )
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
+                            guid
+                        )
                     return False
                 if r.status != 200:
                     raise Exception(f"HTTP {r.status}")
@@ -246,10 +252,11 @@ async def fetch_and_download(session, semaphore, conn, gcs_bucket, guid):
                 await rate_tracker.record_success()
         except Exception as e:
             log.error(f"Failed to download PDF for {guid}: {e}")
-            await conn.execute(
-                "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
-                guid
-            )
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
+                    guid
+                )
             return False
 
         # Upload to GCS (blocking call — run in executor)
@@ -258,18 +265,20 @@ async def fetch_and_download(session, semaphore, conn, gcs_bucket, guid):
             await loop.run_in_executor(None, _upload_to_gcs, gcs_bucket, gcs_path, content)
         except Exception as e:
             log.error(f"Failed to upload to GCS for {guid}: {e}")
-            await conn.execute(
-                "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
-                guid
-            )
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE decisions SET attempts=attempts+1, status='failed', updated_at=NOW() WHERE guid=$1",
+                    guid
+                )
             return False
 
-        await conn.execute("""
-            UPDATE decisions SET
-                oblast=$1, pod_oblast=$2, dokument_name=$3, dokument_size=$4,
-                dokument_url=$5, gcs_path=$6, status='done', updated_at=NOW()
-            WHERE guid=$7
-        """, oblast, pod_oblast, doc_name, doc_size, doc_url, gcs_path, guid)
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE decisions SET
+                    oblast=$1, pod_oblast=$2, dokument_name=$3, dokument_size=$4,
+                    dokument_url=$5, gcs_path=$6, status='done', updated_at=NOW()
+                WHERE guid=$7
+            """, oblast, pod_oblast, doc_name, doc_size, doc_url, gcs_path, guid)
 
         await asyncio.sleep(DELAY)
         return True
@@ -280,13 +289,14 @@ def _upload_to_gcs(bucket, gcs_path, content):
     blob.upload_from_file(BytesIO(content), content_type="application/pdf")
 
 
-async def download_all(session, conn, gcs_bucket):
+async def download_all(session, pool, gcs_bucket):
     log.info("Starting downloads...")
 
-    total = await conn.fetchval("""
-        SELECT COUNT(*) FROM decisions
-        WHERE status != 'done' AND status != 'dead' AND attempts < $1
-    """, MAX_RETRIES)
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("""
+            SELECT COUNT(*) FROM decisions
+            WHERE status != 'done' AND status != 'dead' AND attempts < $1
+        """, MAX_RETRIES)
     log.info(f"Pending downloads: {total}")
 
     semaphore = asyncio.Semaphore(MAX_WORKERS)
@@ -297,13 +307,14 @@ async def download_all(session, conn, gcs_bucket):
     last_guid = ""
 
     while True:
-        rows = await conn.fetch("""
-            SELECT guid FROM decisions
-            WHERE status != 'done' AND status != 'dead' AND attempts < $1
-                AND guid > $2
-            ORDER BY guid
-            LIMIT $3
-        """, MAX_RETRIES, last_guid, BATCH_SIZE)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT guid FROM decisions
+                WHERE status != 'done' AND status != 'dead' AND attempts < $1
+                    AND guid > $2
+                ORDER BY guid
+                LIMIT $3
+            """, MAX_RETRIES, last_guid, BATCH_SIZE)
 
         if not rows:
             break
@@ -313,7 +324,7 @@ async def download_all(session, conn, gcs_bucket):
 
         async def tracked(guid):
             nonlocal done, failed
-            result = await fetch_and_download(session, semaphore, conn, gcs_bucket, guid)
+            result = await fetch_and_download(session, semaphore, pool, gcs_bucket, guid)
             if result:
                 done += 1
             else:
@@ -335,27 +346,30 @@ async def main():
     gcs_client = storage.Client()
     gcs_bucket = gcs_client.bucket(GCS_BUCKET)
 
-    conn = await asyncpg.connect(
+    pool = await asyncpg.create_pool(
         host=DB_HOST, port=DB_PORT, database=DB_NAME,
-        user=DB_USER, password=DB_PASSWORD
+        user=DB_USER, password=DB_PASSWORD,
+        min_size=2, max_size=MAX_WORKERS + 2
     )
     try:
-        await init_db(conn)
+        async with pool.acquire() as conn:
+            await init_db(conn)
 
         async with aiohttp.ClientSession() as session:
-            total_collected = await collect_guids(session, conn)
-            done, failed = await download_all(session, conn, gcs_bucket)
+            total_collected = await collect_guids(session, pool)
+            done, failed = await download_all(session, pool, gcs_bucket)
 
         duration = int((datetime.now() - t_start).total_seconds())
         status = "success" if failed == 0 else "partial"
-        await conn.execute("""
-            INSERT INTO download_log (run_date, total_collected, total_downloaded, total_failed, duration_sec, status)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """, datetime.now().date(), total_collected, done, failed, duration, status)
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO download_log (run_date, total_collected, total_downloaded, total_failed, duration_sec, status)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, datetime.now().date(), total_collected, done, failed, duration, status)
 
         log.info(f"Pipeline done in {duration}s")
     finally:
-        await conn.close()
+        await pool.close()
 
 
 asyncio.run(main())
