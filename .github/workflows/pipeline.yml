@@ -1,0 +1,35 @@
+name: Download Pipeline
+
+on:
+  workflow_dispatch:        # Manual trigger only
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360    # 6 hours max
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/699114662770/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: pipeline-runner@docuengine-data-hub.iam.gserviceaccount.com
+
+      - name: Run pipeline
+        env:
+          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+          DB_DSN: ${{ secrets.DB_DSN }}
+          MAX_WORKERS: "8"
+          DELAY: "0.3"
+        run: python downloader_gcp.py
