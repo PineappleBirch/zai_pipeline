@@ -283,32 +283,46 @@ def _upload_to_gcs(bucket, gcs_path, content):
 async def download_all(session, conn, gcs_bucket):
     log.info("Starting downloads...")
 
-    rows = await conn.fetch("""
-        SELECT guid FROM decisions
+    total = await conn.fetchval("""
+        SELECT COUNT(*) FROM decisions
         WHERE status != 'done' AND status != 'dead' AND attempts < $1
     """, MAX_RETRIES)
-
-    guids = [r["guid"] for r in rows]
-    log.info(f"Pending downloads: {len(guids)}")
+    log.info(f"Pending downloads: {total}")
 
     semaphore = asyncio.Semaphore(MAX_WORKERS)
-    total = len(guids)
+    BATCH_SIZE = 5000
     done = 0
     failed = 0
     progress_every = 100
+    last_guid = ""
 
-    async def tracked(guid):
-        nonlocal done, failed
-        result = await fetch_and_download(session, semaphore, conn, gcs_bucket, guid)
-        if result:
-            done += 1
-        else:
-            failed += 1
-        if (done + failed) % progress_every == 0 or (done + failed) == total:
-            pct = (done + failed) / total * 100
-            log.info(f"[{done + failed}/{total}] {pct:.1f}% | done={done} | failed={failed}")
+    while True:
+        rows = await conn.fetch("""
+            SELECT guid FROM decisions
+            WHERE status != 'done' AND status != 'dead' AND attempts < $1
+                AND guid > $2
+            ORDER BY guid
+            LIMIT $3
+        """, MAX_RETRIES, last_guid, BATCH_SIZE)
 
-    await asyncio.gather(*[tracked(guid) for guid in guids])
+        if not rows:
+            break
+
+        guids = [r["guid"] for r in rows]
+        last_guid = guids[-1]
+
+        async def tracked(guid):
+            nonlocal done, failed
+            result = await fetch_and_download(session, semaphore, conn, gcs_bucket, guid)
+            if result:
+                done += 1
+            else:
+                failed += 1
+            if (done + failed) % progress_every == 0:
+                pct = (done + failed) / total * 100
+                log.info(f"[{done + failed}/{total}] {pct:.1f}% | done={done} | failed={failed}")
+
+        await asyncio.gather(*[tracked(guid) for guid in guids])
 
     log.info(f"Downloads complete. Done: {done} | Failed: {failed}")
     return done, failed
